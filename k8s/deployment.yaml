@@ -1,0 +1,99 @@
+# shop-api: the demo workload that IncidentIQ monitors.
+#
+# Baseline is the healthy image shop-api:v1. The failure scripts change ONLY the
+# image tag (kubectl set image), so a rollback is just "go back to the previous
+# ReplicaSet":
+#   v2 -> startup exception "DB_URL missing"  -> CrashLoopBackOff
+#   v3 -> /health returns 500                 -> Running but never Ready
+#   v4 -> memory grows until the limit        -> OOMKilled
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop-api
+  namespace: default
+  labels:
+    app: shop-api
+    app.kubernetes.io/name: shop-api
+    app.kubernetes.io/part-of: incidentiq-demo
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5          # keep old ReplicaSets so rollback has a target
+  progressDeadlineSeconds: 180
+  selector:
+    matchLabels:
+      app: shop-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0            # healthy pods keep serving while a bad version rolls out
+  template:
+    metadata:
+      labels:
+        app: shop-api
+        app.kubernetes.io/name: shop-api
+    spec:
+      automountServiceAccountToken: false   # the demo app never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: shop-api
+          image: shop-api:v1
+          imagePullPolicy: IfNotPresent   # images are loaded into kind, never pulled
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:               # uses "/" so v3 stays Running (not restarted) but unready
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi            # REQUIRED for v4: the allocator refuses to run without a limit
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop-api
+  namespace: default
+  labels:
+    app: shop-api
+spec:
+  type: ClusterIP
+  selector:
+    app: shop-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

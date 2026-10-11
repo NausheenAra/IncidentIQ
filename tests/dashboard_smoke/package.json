@@ -1,0 +1,7 @@
+{
+  "name": "incidentiq-dashboard-smoke",
+  "private": true,
+  "description": "Optional browser-level smoke test for the IncidentIQ dashboard (not needed to run the app).",
+  "scripts": { "test": "node smoke.js" },
+  "devDependencies": { "jsdom": "^26.0.0" }
+}

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IncidentIQ - Incidents</title>
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Cpath d='M6 17h5l3-8 4 14 3-6h5' fill='none' stroke='%2358a6ff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="index">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>IncidentIQ</h1>
+        <p class="tagline">AI-assisted Kubernetes incident response</p>
+      </div>
+    </div>
+    <div id="status-strip" class="chips" aria-label="System status" aria-live="polite">
+      <span class="chip chip-muted">Connecting&hellip;</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <div id="error-banner" class="banner banner-error" role="alert" hidden></div>
+
+    <section aria-labelledby="metrics-heading">
+      <h2 id="metrics-heading" class="visually-hidden">Summary metrics</h2>
+      <div class="cards">
+        <article class="card">
+          <h3>Incidents</h3>
+          <p id="metric-total" class="card-value">&ndash;</p>
+          <p class="card-note">total detected</p>
+        </article>
+        <article class="card">
+          <h3>Resolved</h3>
+          <p id="metric-resolved" class="card-value">&ndash;</p>
+          <p class="card-note">recovery verified</p>
+        </article>
+        <article class="card">
+          <h3>Avg MTTD</h3>
+          <p id="metric-mttd" class="card-value">&ndash;</p>
+          <p class="card-note">injection &rarr; detection</p>
+        </article>
+        <article class="card">
+          <h3>Avg MTTR</h3>
+          <p id="metric-mttr" class="card-value">&ndash;</p>
+          <p class="card-note">detection &rarr; resolved</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="incidents-heading">
+      <div class="panel-head">
+        <h2 id="incidents-heading">Incidents</h2>
+        <span id="refresh-note" class="muted small">Refreshes every 3 seconds</span>
+      </div>
+      <p id="incident-state" class="state" role="status">Loading incidents&hellip;</p>
+      <div id="incident-table-wrap" class="table-wrap" hidden>
+        <table id="incident-table">
+          <thead>
+            <tr>
+              <th scope="col">ID</th>
+              <th scope="col">Service</th>
+              <th scope="col">Namespace</th>
+              <th scope="col">Status</th>
+              <th scope="col">Reason</th>
+              <th scope="col">Detected</th>
+              <th scope="col" class="num">MTTD</th>
+              <th scope="col" class="num">MTTR</th>
+            </tr>
+          </thead>
+          <tbody id="incident-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="footnote muted small">
+      MTTD is only shown when a failure injection was recorded before detection.
+      MTTR only counts incidents whose recovery was verified. Missing values show a dash, never a zero.
+    </p>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

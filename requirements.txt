@@ -1,0 +1,7 @@
+# IncidentIQ development + test dependencies.
+# Runtime packages live in requirements-backend.txt so the container image does
+# not ship pytest. The versions are lower bounds; the README lists the versions
+# the project was actually verified with.
+-r requirements-backend.txt
+pytest>=8.0
+httpx>=0.27

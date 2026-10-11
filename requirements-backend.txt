@@ -1,0 +1,7 @@
+# Runtime dependencies of the IncidentIQ backend (installed in backend.Dockerfile).
+# requirements.txt adds the test-only packages on top of this file.
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn>=0.29
+kubernetes>=29.0
+google-genai>=1.0

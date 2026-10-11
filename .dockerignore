@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+data
+*.db
+tests
+docs
+scripts
+k8s
+app
+node_modules

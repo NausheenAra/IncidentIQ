@@ -1,0 +1,17 @@
+# kind cluster used by scripts/setup_cluster.sh (single node, demo only).
+#
+# extraPortMappings publishes the NodePort that k8s/backend.yaml (Stage 7) will
+# use, so the containerized IncidentIQ dashboard is reachable at
+# http://localhost:8080 . Port mappings can only be set when the cluster is
+# created; if you created a kind cluster earlier without them, run
+# "kind delete cluster --name incidentiq" and re-run scripts/setup_cluster.sh.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: incidentiq
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        listenAddress: "127.0.0.1"
+        protocol: TCP

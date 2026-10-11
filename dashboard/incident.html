@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IncidentIQ - Incident</title>
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Cpath d='M6 17h5l3-8 4 14 3-6h5' fill='none' stroke='%2358a6ff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="incident">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>IncidentIQ</h1>
+        <p class="tagline">AI-assisted Kubernetes incident response</p>
+      </div>
+    </div>
+    <div id="status-strip" class="chips" aria-label="System status" aria-live="polite">
+      <span class="chip chip-muted">Connecting&hellip;</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <p><a class="back-link" href="/">&larr; All incidents</a></p>
+    <div id="error-banner" class="banner banner-error" role="alert" hidden></div>
+    <p id="detail-state" class="state" role="status">Loading incident&hellip;</p>
+
+    <div id="detail" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 id="detail-title">Incident</h2>
+          <span id="detail-status" class="badge">&ndash;</span>
+        </div>
+        <dl id="summary" class="facts"></dl>
+      </section>
+
+      <section id="approval-panel" class="panel panel-attention" aria-labelledby="approval-heading" hidden>
+        <h2 id="approval-heading">Approval required</h2>
+        <p id="approval-text">Nothing has been changed in the cluster yet.</p>
+        <div class="approval-row">
+          <label for="api-key-input" class="small muted">API key (kept in this browser tab only)</label>
+          <input id="api-key-input" type="password" autocomplete="off" spellcheck="false" placeholder="X-API-Key">
+          <button id="approve-btn" type="button" class="btn btn-primary">Approve remediation</button>
+        </div>
+        <p id="approval-msg" class="small" role="status"></p>
+      </section>
+
+      <section class="panel" aria-labelledby="diagnosis-heading">
+        <h2 id="diagnosis-heading">Diagnosis</h2>
+        <p id="diagnosis-state" class="state" hidden></p>
+        <div id="diagnosis" hidden>
+          <div class="diag-head">
+            <span id="rca-source" class="badge">&ndash;</span>
+            <span id="rca-action" class="badge badge-action">&ndash;</span>
+            <label class="confidence" for="rca-confidence">Confidence
+              <meter id="rca-confidence" min="0" max="1" low="0.4" high="0.7" optimum="1" value="0"></meter>
+              <span id="rca-confidence-text">&ndash;</span>
+            </label>
+          </div>
+          <h3>Probable cause</h3>
+          <p id="rca-cause" class="cause"></p>
+          <h3>Quoted evidence</h3>
+          <ul id="rca-evidence" class="quotes"></ul>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="timeline-heading">
+        <h2 id="timeline-heading">Timeline</h2>
+        <ol id="timeline" class="timeline"></ol>
+      </section>
+
+      <section class="panel" aria-labelledby="evidence-heading">
+        <h2 id="evidence-heading">Collected evidence</h2>
+        <p id="evidence-state" class="state" hidden></p>
+        <div id="evidence">
+          <details class="fold"><summary>Pods <span id="ev-pods-count" class="muted small"></span></summary><div id="ev-pods" class="fold-body"></div></details>
+          <details class="fold"><summary>Logs <span id="ev-logs-count" class="muted small"></span></summary><div id="ev-logs" class="fold-body"></div></details>
+          <details class="fold"><summary>Kubernetes events <span id="ev-events-count" class="muted small"></span></summary><div id="ev-events" class="fold-body"></div></details>
+          <details class="fold"><summary>Rollout history <span id="ev-rollout-count" class="muted small"></span></summary><div id="ev-rollout" class="fold-body"></div></details>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

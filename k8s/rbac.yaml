@@ -1,0 +1,70 @@
+# Least-privilege access for the IncidentIQ backend.
+#
+# The backend runs in its own namespace ("incidentiq"). Everything it may read or
+# change lives in the MONITORED namespace ("default"), granted by a Role +
+# RoleBinding there, never a ClusterRole. The rules below are exactly the union of
+# the RBAC tables in docs/contracts.md (Stage 3 collector/detector, Stage 4
+# remediation). There is no cluster-admin, no access to Secrets, no create/delete.
+#
+# To monitor another namespace, add it to KUBERNETES_NAMESPACE_ALLOWLIST in
+# k8s/backend.yaml AND apply a copy of this Role/RoleBinding in that namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: incidentiq
+  labels:
+    app.kubernetes.io/part-of: incidentiq
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: incidentiq-backend
+  namespace: incidentiq
+  labels:
+    app.kubernetes.io/name: incidentiq-backend
+    app.kubernetes.io/part-of: incidentiq
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: incidentiq-backend
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: incidentiq
+rules:
+  # detector, collector, verify
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # collector: container logs (current and previous)
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # collector: events for the Deployment, its ReplicaSets and pods
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  # detector (pod -> ReplicaSet -> Deployment ownership), collector, rollback, verify
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  # collector + verify read; rollback / restart / scale patch
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: incidentiq-backend
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: incidentiq
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: incidentiq-backend
+subjects:
+  - kind: ServiceAccount
+    name: incidentiq-backend
+    namespace: incidentiq
