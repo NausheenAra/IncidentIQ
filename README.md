@@ -1,217 +1,301 @@
 # IncidentIQ
 
-AI-assisted Kubernetes incident detection, diagnosis and remediation, running as a local demo on
-[kind](https://kind.sigs.k8s.io/). It watches a Deployment (`shop-api`), notices when a bad version breaks it,
-collects evidence, asks Gemini for a structured root-cause analysis (with a deterministic fallback), applies a
-**guarded** remediation after approval, **verifies** recovery, and shows the whole lifecycle with MTTD/MTTR on a dashboard.
+**IncidentIQ** is an AI-assisted Kubernetes incident detection, diagnosis, and guarded-remediation demo. It runs locally on a [kind](https://kind.sigs.k8s.io/) cluster and watches a demo Deployment named `shop-api`.
 
-```
-deploy v1 -> inject v2/v3/v4 -> detect -> collect evidence -> diagnose -> approve -> remediate -> verify -> dashboard
+When a bad application version breaks the service, IncidentIQ detects the unhealthy workload, collects evidence, requests a structured root-cause analysis from Gemini (with a deterministic fallback), recommends a guarded remediation, supports an approval step, verifies recovery, and records the incident lifecycle and MTTD/MTTR on a dashboard.
+
+```text
+deploy v1 -> inject faulty version -> detect -> collect evidence -> diagnose
+          -> approve -> remediate -> verify -> dashboard
 ```
 
-This is a local demonstration, **not** a production system (see [Security and limits](#security-and-limits)).
+> **Scope:** IncidentIQ is a local demonstration, not a production-ready incident-management platform. See [Security and limitations](#security-and-limitations).
 
 ## Contents
-[Prerequisites](#prerequisites) | [Quick start](#quick-start) | [Failure scenarios](#failure-scenarios) | [Configuration](#configuration) |
-[Tests](#tests) | [Demo script](docs/demo.md) | [Troubleshooting](#troubleshooting) | [Security and limits](#security-and-limits) |
-[Project status](#project-status-what-is-and-is-not-verified) | [Layout](#repository-layout)
+
+- [Features](#features)
+- [Architecture and workflow](#architecture-and-workflow)
+- [Prerequisites](#prerequisites)
+- [Quick start](#quick-start)
+- [Failure scenarios](#failure-scenarios)
+- [Configuration](#configuration)
+- [Tests](#tests)
+- [Demo script](docs/demo.md)
+- [Troubleshooting](#troubleshooting)
+- [Security and limitations](#security-and-limitations)
+- [Project status](#project-status)
+- [Repository layout](#repository-layout)
+
+## Features
+
+- **Kubernetes health detection:** polls Kubernetes and identifies unhealthy application workloads.
+- **Evidence collection:** gathers pod states, logs, events, deployment information, and rollout history.
+- **AI-assisted root-cause analysis:** requests structured JSON analysis from Gemini when configured.
+- **Deterministic fallback:** continues with fallback diagnosis when Gemini is not configured or a model response cannot be used.
+- **Guarded remediation:** supports a limited set of actions and requires approval by default.
+- **Recovery verification:** an incident is marked `RESOLVED` only after the verifier reports recovery.
+- **Incident dashboard:** displays incident details, timeline, evidence, diagnosis, and MTTD/MTTR.
+- **Local reproducibility:** provides scripts for cluster setup, healthy and faulty deployments, backend deployment, and teardown.
+
+## Architecture and workflow
+
+1. **Run the demo service.** `shop-api` starts with a healthy version.
+2. **Inject a fault.** The bad-deploy script records the injection time with IncidentIQ, then deploys a selected faulty version.
+3. **Detect the incident.** The backend polls Kubernetes and detects unhealthy pods or deployments.
+4. **Collect evidence.** IncidentIQ gathers relevant Kubernetes state, logs, events, and deployment history.
+5. **Diagnose.** Gemini returns a structured root-cause analysis when available; otherwise, the deterministic fallback is used.
+6. **Review and approve.** By default, the incident waits for an approval before remediation.
+7. **Remediate.** The guarded engine can select only the allowed actions: `rollback`, `restart`, or `scale`.
+8. **Verify.** Recovery is checked rather than assumed from a successful remediation API call.
+9. **Record and display.** The incident lifecycle and measured timing information appear on the dashboard.
 
 ## Prerequisites
 
 | Tool | Check | Notes |
 |---|---|---|
-| Docker (Desktop on Windows/macOS) | `docker --version` and `docker info` | engine must be running, Linux containers / WSL 2 |
-| kubectl | `kubectl version --client` | |
-| kind | `kind --version` | |
-| Python 3.10+ | `python3 --version` | only needed to run tests or run the backend outside the cluster |
-| bash | | on Windows use Git Bash or WSL; the scripts are bash |
-| Gemini API key | optional | https://aistudio.google.com/ . Without it the deterministic fallback diagnosis is used |
+| Docker (Docker Desktop on Windows/macOS) | `docker --version` and `docker info` | Docker engine must be running with Linux containers; Windows may use WSL 2. |
+| `kubectl` | `kubectl version --client` | Kubernetes command-line client. |
+| `kind` | `kind --version` | Runs a local Kubernetes cluster in Docker. |
+| Python 3.10+ | `python --version` or `python3 --version` | Needed for tests and some local development tasks. |
+| Bash | — | On Windows, use Git Bash or WSL; project scripts are Bash scripts. |
+| Gemini API key | Optional | Obtain one from [Google AI Studio](https://aistudio.google.com/). Without a usable key, the deterministic fallback diagnosis is used. |
 
 ## Quick start
 
-All commands run from the repository root.
+Run commands from the repository root. On Windows, run the Bash scripts from Git Bash or WSL.
+
+### 1. Create the local cluster and demo application
 
 ```bash
-# 1. One-time setup: kind cluster, shop-api v1..v4 images, healthy v1 deployed, .venv, .env with a generated API_KEY
 scripts/setup_cluster.sh
+```
 
-# 2. (optional) enable Gemini: put your key in .env
-#      GEMINI_API_KEY=...
+This script sets up the kind cluster, builds and loads the demo images, deploys the healthy `shop-api` version, prepares the Python virtual environment, and creates a local `.env` with a generated `API_KEY`.
 
-# 3. Build and deploy the IncidentIQ backend into the cluster (RBAC, Secret, Deployment, Service)
+### 2. (Optional) Configure Gemini
+
+Put your own Gemini key in your local `.env` file:
+
+```dotenv
+GEMINI_API_KEY=your_gemini_api_key_here
+```
+
+Use a real key only in your local `.env`; never put it in `.env.example`, source code, screenshots, or Git history. The `.env` file is git-ignored. If the key is blank, IncidentIQ uses the deterministic fallback diagnosis.
+
+### 3. Build and deploy the IncidentIQ backend
+
+```bash
 scripts/deploy_backend.sh
+```
 
-# 4. Open the dashboard
-#      http://localhost:8080
+The script builds and loads the backend image, configures its Kubernetes permissions and configuration, creates the Kubernetes Secret from local `.env` values, and deploys the backend.
 
-# 5. Break the app. This records the injection time first (for MTTD), then deploys the bad image.
+### 4. Open the dashboard
+
+By default, the local kind setup publishes the dashboard/backend at:
+
+```text
+http://localhost:8080
+```
+
+If port `8080` is already occupied or your cluster was created without the required port mapping, consult [Troubleshooting](#troubleshooting).
+
+### 5. Inject a failure
+
+```bash
 BACKEND_URL=http://localhost:8080 scripts/deploy_bad.sh v2
+```
 
-# 6. Watch the incident appear on the dashboard, review the diagnosis, click "Approve remediation".
-#    The incident is RESOLVED only after the verifier sees every pod Running and Ready.
+The script records the injection time first, then deploys the faulty version. This timestamp is used when calculating detection timing.
 
-# 7. Put the healthy version back (any time)
+### 6. Review the incident
+
+Open the dashboard, inspect the evidence and diagnosis, and click **Approve remediation** when the incident is awaiting approval. The incident should be marked `RESOLVED` only after the verifier reports that the workload has recovered.
+
+### 7. Restore the healthy version
+
+```bash
 scripts/deploy_good.sh
 ```
 
-`.env` is created from `.env.example` and is git-ignored. Re-run `scripts/deploy_backend.sh` after changing `.env`
-or any backend code (it rebuilds the image and restarts the pod). Delete everything with `scripts/teardown.sh`.
-
-**Run the backend on your machine instead of in the cluster** (handy for development):
+You can remove the local demo resources with:
 
 ```bash
-.venv/bin/python -m uvicorn backend.api:app --port 8000        # Windows: .venv\Scripts\python.exe
-# dashboard: http://localhost:8000   and   scripts/deploy_bad.sh v2   (default BACKEND_URL)
+scripts/teardown.sh
 ```
 
-Use exactly **one** uvicorn worker: the detector loop lives inside the process.
+### Run the backend outside the cluster (development)
+
+For local backend development, use one Uvicorn worker because the detector loop runs inside the process:
+
+```bash
+.venv/bin/python -m uvicorn backend.api:app --port 8000
+```
+
+On Windows PowerShell:
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn backend.api:app --port 8000
+```
+
+The dashboard is then available at `http://localhost:8000`. In this mode, `scripts/deploy_bad.sh` uses its default `BACKEND_URL` unless you override it.
 
 ## Failure scenarios
 
-| Version | What it does | Kubernetes symptom | Detector reason |
+| Version | Intended behavior | Kubernetes symptom | Detector reason |
 |---|---|---|---|
-| v1 | healthy | Running and Ready | none |
-| v2 | startup raises `Exception("DB_URL missing")` | `CrashLoopBackOff` | `CrashLoopBackOff` |
-| v3 | `/health` returns 500 | Running, never Ready | `NotReady` (after the 30 s grace period) |
-| v4 | leaks memory until the 128Mi limit | `OOMKilled` | `OOMKilled` |
+| `v1` | Healthy application | Running and Ready | None |
+| `v2` | Startup raises `Exception("DB_URL missing")` | `CrashLoopBackOff` | `CrashLoopBackOff` |
+| `v3` | `/health` returns HTTP 500 | Running but never Ready | `NotReady` after the 30-second grace period |
+| `v4` | Leaks memory until the 128 MiB limit | `OOMKilled` | `OOMKilled` |
 
-Start with v2; it is the most reliable demonstration. The allowed remediations are only `rollback`, `restart` and `scale`.
-For these faults `rollback` is the one that actually repairs the service; a `restart` of a bad version fails verification
-and the incident correctly ends `FAILED` rather than pretending success.
+Start with `v2`; it is the most straightforward demonstration. The permitted remediation actions are `rollback`, `restart`, and `scale`. For these example faults, rollback is the action intended to restore the prior healthy version. Restarting a still-broken version should fail verification rather than being reported as a successful recovery.
 
 ## Configuration
 
-Every setting is validated at startup by `backend/config.py`; a bad value stops the backend with a clear message.
-Safe defaults are in `.env.example` (full table with ranges in `docs/contracts.md`, section 1). The ones you will touch:
+Settings are validated at startup by `backend/config.py`. Safe defaults and examples are documented in `.env.example`; see also `docs/contracts.md` for configuration details.
 
-| Variable | Default | Meaning |
+| Variable | Default or source | Meaning |
 |---|---|---|
-| `API_KEY` | generated by `setup_cluster.sh` | protects `POST /api/incidents/{id}/approve` and `POST /api/injection`; 32+ chars in production |
-| `GEMINI_API_KEY` | empty | empty means fallback diagnosis |
-| `AUTO_REMEDIATE` | `false` | `false` waits in `AWAITING_APPROVAL`; `true` remediates immediately (the guardrails still apply) |
-| `KUBERNETES_NAMESPACE_ALLOWLIST` | `default` | the only namespaces inspected or changed; wildcards are rejected |
-| `ROLLBACK_MODE` | `python` | `kubectl` also needs the image built with `INSTALL_KUBECTL=true` |
-| `MAX_REMEDIATION_ATTEMPTS` | `2` | hard cap per incident (1-2) |
-| `VERIFICATION_TIMEOUT_SECONDS` | `120` | how long recovery is polled (every 5 s) before the incident is `FAILED` |
-| `INCIDENT_COOLDOWN_SECONDS` | `60` | no new incident for the same service for this long after one closes |
+| `API_KEY` | Generated by `setup_cluster.sh` | Protects write endpoints such as `POST /api/incidents/{id}/approve` and `POST /api/injection`; production configuration requires 32 or more characters. |
+| `GEMINI_API_KEY` | Empty | Empty means use fallback diagnosis. Keep any real key in local `.env` only. |
+| `GEMINI_MODEL` | Set in configuration | Gemini model name used for diagnosis. |
+| `AUTO_REMEDIATE` | `false` | When false, incidents wait in `AWAITING_APPROVAL`; when true, remediation may run immediately, subject to guardrails. |
+| `KUBERNETES_NAMESPACE_ALLOWLIST` | `default` | Namespaces IncidentIQ is allowed to inspect or change; wildcards are rejected. |
+| `ROLLBACK_MODE` | `python` | `kubectl` mode also requires an image built with `INSTALL_KUBECTL=true`. |
+| `MAX_REMEDIATION_ATTEMPTS` | `2` | Hard cap per incident (1–2). |
+| `VERIFICATION_TIMEOUT_SECONDS` | `120` | Maximum time to poll for recovery before the incident is marked `FAILED`. |
+| `INCIDENT_COOLDOWN_SECONDS` | `60` | Prevents a new incident for the same service for this period after one closes. |
 
-In the cluster these live in the `incidentiq-config` ConfigMap in `k8s/backend.yaml`; the two secrets live in the
-`incidentiq-secrets` Secret that `deploy_backend.sh` creates from `.env`. Neither the Secret nor `.env` is ever committed.
+In Kubernetes, non-secret settings live in the `incidentiq-config` ConfigMap. Secret values are supplied to the `incidentiq-secrets` Secret by `scripts/deploy_backend.sh` from local `.env`. Do not commit `.env` or real credentials.
+
+After changing `.env` or backend code, rerun:
+
+```bash
+scripts/deploy_backend.sh
+```
+
+This rebuilds and redeploys the backend.
 
 ## Tests
 
+Install dependencies and run the Python test suite:
+
 ```bash
 python -m pip install -r requirements.txt
-python -m pytest                         # 554 tests; no cluster, network or Gemini key needed
+python -m pytest
 ```
+
+The repository's test documentation reports **554 tests**. Re-run the suite against the current checkout and use the actual output when reporting a test result.
 
 | Check | Command | Needs |
 |---|---|---|
-| Unit and API tests (database, detector, collector, RCA, remediation, pipeline, API, dashboard files, manifests, runner logic) | `python -m pytest` | Python only |
-| Dashboard in a browser-like environment (real backend, seeded data, approval flow, hostile log line stays inert) | `tests/dashboard_smoke/run.sh` | Node 18+, `npm install` (automatic) |
-| **End-to-end on the real cluster**: v2, v3, v4, approval, verified recovery, MTTD/MTTR, duplicate-incident check | `python scripts/e2e.py` | the cluster from Quick start |
+| Unit and API tests covering database, configuration, detector, collector, RCA, remediation, pipeline, API, dashboard files, manifests, and runner logic | `python -m pytest` | Python dependencies |
+| Dashboard smoke test using a real backend, seeded data, approval flow, and hostile log-line check | `tests/dashboard_smoke/run.sh` | Node 18+; installs npm dependencies automatically |
+| End-to-end scenarios for `v2`, `v3`, `v4`, approval, recovery verification, MTTD/MTTR, and duplicate-incident behavior | `python scripts/e2e.py` | Local kind cluster and deployed backend |
 
-`scripts/e2e.py` talks to `http://localhost:8080` by default (`--backend-url` to change it), reads the API key from
-`.env`, and prints a table such as:
+The end-to-end script uses `http://localhost:8080` by default and reads the API key from `.env`. Use `--backend-url` if your backend is listening on a different port.
 
+Useful flags include `--scenario v2`, `--no-approve`, `--no-restore`, `--detect-timeout`, and `--resolve-timeout`. To test fallback diagnosis, leave `GEMINI_API_KEY` blank and redeploy the backend.
+
+Example output layout (illustrative only; your measurements will differ):
+
+```text
+scenario  incident  status    reason            rca  action    MTTD   MTTR   result
+v2        #1        RESOLVED  CrashLoopBackOff  llm  rollback  8.2s   41.0s  PASS
 ```
-scenario  incident  status            reason            rca       action    MTTD     MTTR     result
-v2        #1        RESOLVED          CrashLoopBackOff  llm       rollback  8.2s     41.0s    PASS
-```
 
-(illustrative layout only; your numbers will differ). Useful flags: `--scenario v2`, `--no-approve` (stop at the approval gate),
-`--no-restore`, `--detect-timeout`, `--resolve-timeout`.
-To test the **fallback path**, leave `GEMINI_API_KEY` empty (or set a wrong one) and redeploy the backend; the report then
-notes `diagnosis used the deterministic fallback`.
+MTTD is the time from recorded injection to detection. MTTR is the time from detection to resolution. Values are measured; they should not be filled with zero when unavailable.
 
 ## Troubleshooting
 
-| Symptom | Cause and fix |
+| Symptom | Possible cause and fix |
 |---|---|
-| `docker is not recognized` / `docker info` cannot connect | Install or start Docker Desktop, reopen the terminal, check PATH, use Linux containers. |
-| `kind is not recognized` | Install kind (Windows: the AMD64 binary), put it on PATH, open a new terminal. |
-| `ImagePullBackOff` on `shop-api` or `incidentiq-backend` | The image is not inside the kind node. Re-run `scripts/setup_cluster.sh` (shop-api) or `scripts/deploy_backend.sh` (backend). Images are loaded, never pulled. |
-| Backend pod `CreateContainerConfigError` | The Secret `incidentiq-secrets` is missing. Run `scripts/deploy_backend.sh` (it creates it from `.env`). |
-| Backend pod `CrashLoopBackOff` | `kubectl --context kind-incidentiq -n incidentiq logs deployment/incidentiq-backend`. Usually a config error: in the cluster `APP_ENV=production` requires an `API_KEY` of 32+ characters. |
-| `http://localhost:8080` does not answer | The cluster was created before the port mapping existed. `scripts/teardown.sh` then `scripts/setup_cluster.sh` (port mappings can only be set at creation). |
-| Dashboard chip says `Cluster: forbidden` | RBAC is missing or wrong: `kubectl --context kind-incidentiq apply -f k8s/rbac.yaml`. |
-| Dashboard chip says `Cluster: not configured` / `unreachable` | Running locally: check your kubeconfig and `KUBE_CONTEXT=kind-incidentiq`. In the cluster: check the pod's ServiceAccount token is mounted. |
-| `deploy_bad.sh` says it cannot connect | It posts to `BACKEND_URL` (default `http://localhost:8000`). With the in-cluster backend use `BACKEND_URL=http://localhost:8080`. |
-| `deploy_bad.sh` / approve returns 401 | The key in `.env` differs from the key in the cluster Secret. Re-run `scripts/deploy_backend.sh` so they match. |
-| CrashLoopBackOff but no incident | An incident for `shop-api` is already open, or the cooldown (60 s) after the last one has not passed, or the namespace is not in the allow-list. Check `GET /api/status` and the incident list. |
-| MTTD shows a dash | The injection was not recorded before detection, it was older than `INJECTION_MAX_AGE_SECONDS` (600 s), or `BACKEND_URL` was wrong. A dash means "not measured", never zero. |
-| MTTR shows a dash | MTTR counts only `RESOLVED` incidents. `FAILED` ones are excluded on purpose. |
-| `No previous logs` in the evidence | Kubernetes did not keep the earlier container instance. This is missing evidence, not an error; the current logs are used instead. |
-| Diagnosis says `Fallback heuristic` | No Gemini key, a timeout, an invalid reply, or a quoted log line the model invented. The fallback chooses `rollback` if the last deployment change was within 10 minutes, otherwise `restart`. |
-| Incident ended `FAILED` after a rollback | The previous revision was not healthy, or recovery took longer than `VERIFICATION_TIMEOUT_SECONDS`. Read the last timeline entry; it contains the verifier's reason. |
-| Incidents disappear after the backend pod restarts | SQLite lives on an `emptyDir`; that is a demo trade-off. Incidents that were mid-flight when the process stopped are marked `FAILED` ("interrupted by a backend restart") at the next start. |
-| Dashboard blank or unstyled | The page is served with a strict CSP (same-origin only). Hard-refresh, and check the browser console for a blocked resource if you edited the HTML. |
+| `docker is not recognized` or `docker info` cannot connect | Install/start Docker Desktop, reopen the terminal, check PATH, and use Linux containers. |
+| `kind is not recognized` | Install the appropriate kind binary, add it to PATH, and open a new terminal. |
+| `ImagePullBackOff` on `shop-api` or `incidentiq-backend` | The image may not be loaded into the kind node. Rerun `scripts/setup_cluster.sh` for `shop-api` or `scripts/deploy_backend.sh` for the backend. |
+| Backend pod `CreateContainerConfigError` | The `incidentiq-secrets` Secret may be missing. Run `scripts/deploy_backend.sh` to recreate it from local `.env`. |
+| Backend pod `CrashLoopBackOff` | Inspect logs with `kubectl --context kind-incidentiq -n incidentiq logs deployment/incidentiq-backend`. Check required configuration, including a sufficiently long `API_KEY` in production mode. |
+| `http://localhost:8080` does not respond | Check whether the cluster was created with the required port mapping and whether another process occupies port 8080. Port mappings are set at cluster creation. |
+| Dashboard says `Cluster: forbidden` | Check the namespaced RBAC configuration and apply `k8s/rbac.yaml` if appropriate. |
+| Dashboard says `Cluster: not configured` or `unreachable` | For local execution, check kubeconfig and `KUBE_CONTEXT=kind-incidentiq`. In-cluster execution requires the ServiceAccount token to be available. |
+| `deploy_bad.sh` cannot connect | It posts to `BACKEND_URL` (default `http://localhost:8000`). Set `BACKEND_URL` to the port where your backend is listening. |
+| `deploy_bad.sh` or approval returns 401 | The key in local `.env` may differ from the key in the Kubernetes Secret. Rerun `scripts/deploy_backend.sh` after confirming local configuration. |
+| CrashLoopBackOff but no incident appears | An incident may already be open, the cooldown may not have elapsed, or the namespace may not be allow-listed. Check the incident list and status endpoint. |
+| MTTD shows a dash | The injection time may not have been recorded, may be too old, or may have been sent to the wrong backend URL. A dash means “not measured,” not zero. |
+| MTTR shows a dash | MTTR is counted only for incidents that reach `RESOLVED`; failed incidents are excluded. |
+| Evidence says `No previous logs` | Kubernetes may not have retained the earlier container instance. The collector may use current logs instead. |
+| Diagnosis says `Fallback heuristic` | Gemini may be unconfigured, unavailable, timed out, or returned an unusable response. Check backend logs and configuration. |
+| Incident ends `FAILED` after rollback | The previous revision may not be healthy, or recovery may have exceeded `VERIFICATION_TIMEOUT_SECONDS`. Inspect the last timeline entry for the verifier's reason. |
+| Incidents disappear after backend restart | SQLite uses an `emptyDir` volume in this demo, so its data is not durable across relevant pod/cluster recreation. |
+| Dashboard is blank or unstyled | Hard-refresh the browser and check the browser console for content-security-policy or resource errors. |
 
-## Security and limits
+## Security and limitations
 
-* **Least privilege.** The backend has a namespaced Role in `default` (read pods, logs, events, ReplicaSets; read and patch
-  Deployments). No cluster-admin, no Secrets access, no create/delete. `k8s/rbac.yaml` is checked by tests against the contracts.
-* **Guarded remediation.** Only `rollback`, `restart`, `scale`; only allow-listed namespaces; at most two attempts per incident;
-  a second rollback of the same incident is refused; approval is required by default. The model's answer is only a recommendation: it
-  is validated, and the action that runs is the **stored** one, never one supplied in the approve request.
-* **Verification, not hope.** A successful API call never marks an incident `RESOLVED`; only a passing verification does.
-* **Untrusted input.** Logs and events are treated as untrusted: secrets are redacted, the model is told to use only the evidence,
-  quoted evidence must exist in the collected data, and the dashboard writes all text with `textContent` under a strict CSP.
-* **Writes need the API key; reads do not.** `GET` endpoints (incidents, evidence including log excerpts, metrics) are
-  unauthenticated in this demo. The kind mapping publishes port 8080 on `127.0.0.1` only. **Do not expose the API or the dashboard
-  beyond your machine** without adding authentication and authorization.
-* **Not production.** SQLite on an `emptyDir`, a single backend replica, no high availability, no TLS, and a root-cause analysis that
-  is a best effort, not guaranteed accurate. Keep a human approving risky changes.
-* **Secrets.** Never commit `.env` or a key. `.gitignore` excludes `.env*` (except `.env.example`), the Docker context excludes them,
-  and a test fails if a key appears in the manifests.
+- **Least privilege:** the backend is intended to use a namespaced Role in `default` for required pod, log, event, ReplicaSet, and Deployment operations. It should not require cluster-admin access or Secrets read access.
+- **Guarded remediation:** only `rollback`, `restart`, and `scale` are permitted. Namespace allow-lists and attempt limits apply; approval is required by default.
+- **Verification matters:** a successful Kubernetes API call does not by itself mark an incident `RESOLVED`; the verifier must report recovery.
+- **Untrusted evidence:** logs and events may contain untrusted input. The design redacts secrets, constrains model instructions to collected evidence, validates quoted evidence, and renders dashboard text safely.
+- **API exposure:** write endpoints require an API key, but read endpoints—including incident details and evidence—are unauthenticated in this demo. Keep the dashboard/API bound to your own machine. Do not expose it to the internet without adding appropriate authentication, authorization, TLS, and network controls.
+- **Not production-ready:** the demo uses SQLite on an `emptyDir`, a single backend process, no high availability, and no TLS. Root-cause analysis is best-effort and is not guaranteed to be correct. Keep a human in the loop for remediation.
+- **Secrets:** never commit `.env`, real API keys, service-account credentials, or other secrets. `.gitignore` should exclude local `.env` files while allowing the sanitized `.env.example`. Check the contents of example files before pushing to a public repository.
 
-## Project status: what is and is not verified
+## Project status
 
-| Area | Status |
+IncidentIQ has been exercised locally using a kind Kubernetes cluster. The following items were observed during the local `v2` demonstration, based on the project run and logs:
+
+- The IncidentIQ backend was deployed in the local cluster.
+- The intentionally faulty `shop-api:v2` version was deployed.
+- Backend logs showed detection of unhealthy pods, including `CrashLoopBackOff` and `HighRestartCount`.
+- The Gemini API request returned HTTP 200.
+- The dashboard displayed a root-cause diagnosis identifying the missing `DB_URL` configuration.
+- The dashboard later displayed the incident as `RESOLVED` and indicated that recovery had been verified.
+
+These observations describe the demonstrated `v2` workflow. They do **not** by themselves establish that every failure scenario, fallback path, security property, or automated end-to-end test has passed. Record the actual output of the test suite and any `v3`/`v4`/fallback runs separately.
+
+### Acceptance checklist
+
+Use this checklist to record repeatable results from your own runs:
+
+- [ ] A clean setup following this README succeeds (`setup_cluster.sh`, then `deploy_backend.sh`).
+- [ ] `python -m pytest` passes on the current checkout.
+- [ ] The healthy app deploys repeatably (`deploy_good.sh` run twice).
+- [ ] `v2` is detected end to end, with exactly one incident.
+- [ ] Evidence and root-cause analysis are stored with the incident.
+- [ ] Remediation waits for approval by default and obeys the guardrails.
+- [ ] The incident is `RESOLVED` only after verification and is `FAILED` with useful detail when recovery fails.
+- [ ] The dashboard shows lifecycle, evidence, diagnosis, timeline, and measured MTTD/MTTR.
+- [ ] The fallback path works with Gemini unavailable.
+- [ ] `v3` and `v4` behave as described in the failure-scenarios table.
+- [ ] No real secrets are present in tracked files or Git history.
+
+### Observed local demonstration
+
+| Item | Observation |
 |---|---|
-| Database, config, detector, collector, RCA, remediation, pipeline, API | Unit/API tested: **554 tests pass** (Python 3.12.3, FastAPI 0.143, kubernetes client 37.0, pytest 9.1) against simulated Kubernetes. |
-| Dashboard | Static contract tests plus a jsdom run against the real backend (both pages, metrics, timeline, evidence, approval with no/wrong/correct key, hostile log line inert, 404 page). **Not yet looked at in a real browser by a person.** |
-| Kubernetes manifests | Parsed and checked by tests (exact RBAC, ConfigMap accepted by the config loader, ports match kind). **Not yet applied to a cluster.** |
-| Docker images, kind cluster, real RBAC enforcement, in-cluster config, real Gemini calls | **Not yet exercised.** They need your machine. |
-| Real end-to-end behaviour (v2/v3/v4 detection times, rollback recovery, MTTD/MTTR numbers) | **Not yet demonstrated.** Run `python scripts/e2e.py` and record the result below. |
+| Environment | Local Docker/kind Kubernetes cluster |
+| Fault scenario | `shop-api:v2` |
+| Detection | `CrashLoopBackOff` and `HighRestartCount` appeared in backend logs |
+| AI integration | Gemini request returned HTTP 200 |
+| Diagnosis | Dashboard showed missing `DB_URL` as the root cause |
+| Final dashboard status | `RESOLVED`; dashboard indicated recovery verification |
 
-Do not call the project complete until the boxes below are ticked from a real run.
-
-### Acceptance checklist (tick from your own clean run)
-
-- [ ] A clean setup following only this README works (`setup_cluster.sh`, `deploy_backend.sh`)
-- [ ] `python -m pytest` passes
-- [ ] The healthy app deploys repeatably (`deploy_good.sh` run twice)
-- [ ] v2 is detected end to end, with exactly one incident
-- [ ] Evidence and the RCA are stored with the incident
-- [ ] Remediation waits for approval, then obeys the guardrails
-- [ ] The incident is `RESOLVED` only after verification (and `FAILED` with useful detail otherwise)
-- [ ] The dashboard shows the lifecycle, evidence, diagnosis, timeline and measured MTTD/MTTR
-- [ ] The demo works with Gemini unavailable (fallback path)
-- [ ] v3 and v4 behave as in the table above
-- [ ] No secrets are in git (`git log -p | grep -i api_key` shows only `.env.example` placeholders)
-
-### Observed results (fill in)
-
-| Run date | Scenario | Diagnosis source | Action | Final status | MTTD | MTTR | Notes |
-|---|---|---|---|---|---|---|---|
-| | v2 | | | | | | |
-| | v3 | | | | | | |
-| | v4 | | | | | | |
-
-MTTD = detection time minus the recorded injection time. MTTR = resolution time minus detection time. Both are measured, never defaulted to zero.
+Do not add timing measurements or claim additional scenarios passed unless you have the corresponding run output.
 
 ## Repository layout
 
-```
-app/                  shop-api demo service (v1-v4) + Dockerfile
-backend/              config, db, kube, detector, collector, rca, remediation, pipeline, api
-dashboard/            index.html, incident.html, style.css, app.js (no build step)
-k8s/                  deployment.yaml (shop-api), rbac.yaml, backend.yaml, kind-config.yaml
-scripts/              setup_cluster.sh, deploy_good.sh, deploy_bad.sh, deploy_backend.sh, teardown.sh, e2e.py
-tests/                pytest suite + dashboard_smoke/ (optional jsdom check)
-docs/                 contracts.md (interfaces, source of truth), architecture.md, demo.md
-backend.Dockerfile    backend image            requirements*.txt   dependencies
+```text
+app/                  shop-api demo service (v1-v4) and Dockerfile
+backend/              configuration, database, Kubernetes, detector, collector,
+                      RCA, remediation, pipeline, and API
+dashboard/            index.html, incident.html, style.css, app.js
+k8s/                  deployment.yaml, rbac.yaml, backend.yaml, kind-config.yaml
+scripts/              setup_cluster.sh, deploy_good.sh, deploy_bad.sh,
+                      deploy_backend.sh, teardown.sh, e2e.py
+tests/                pytest suite and dashboard_smoke/
+docs/                 contracts.md, architecture.md, demo.md
+backend.Dockerfile    backend image definition
+requirements*.txt     Python dependencies
 ```
 
-More: [architecture](docs/architecture.md), [demo script](docs/demo.md), [module contracts](docs/contracts.md).
+Further reading: [architecture](docs/architecture.md), [demo script](docs/demo.md), and [module contracts](docs/contracts.md).
