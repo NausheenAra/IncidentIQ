@@ -97,7 +97,23 @@ def test_every_id_the_script_reads_exists_in_the_page():
     js = (DASHBOARD / "app.js").read_text(encoding="utf-8")
     wanted_by_page = {
         "index.html": {"status-strip", "error-banner", "metric-total", "metric-resolved", "metric-mttd", "metric-mttr",
-                       "incident-state", "incident-table-wrap", "incident-rows"},
+                       "incident-state", "incident-table-wrap", "incident-rows",
+                       # multi-cluster live dashboard
+                       "toast", "live-indicator", "live-text", "connect-btn",
+                       "clusters-sub", "cluster-state", "cluster-grid",
+                       "incident-box", "active-count", "active-state", "active-grid",
+                       "kpi-clusters", "kpi-clusters-note", "kpi-pods", "kpi-pods-note",
+                       "analytics-heading", "analytics-cluster", "chart-legend",
+                       "chart-pods", "chart-logs", "chart-errors", "chart-restarts", "chart-unhealthy", "chart-warnings",
+                       "val-pods", "val-logs", "val-errors", "val-restarts", "val-unhealthy", "val-warnings",
+                       "delta-pods", "delta-logs", "delta-errors", "delta-restarts", "delta-unhealthy", "delta-warnings",
+                       "chart-status", "chart-mttr", "chart-reasons",
+                       "workload-state", "workload-wrap", "workload-rows", "activity-state", "activity-list",
+                       "incident-filter",
+                       "connect-dialog", "connect-key", "connect-context", "connect-load", "connect-name",
+                       "connect-msg", "connect-cancel", "connect-submit",
+                       "delete-dialog", "delete-title", "delete-text", "delete-key", "delete-msg",
+                       "delete-cancel", "delete-confirm"},
         "incident.html": {"status-strip", "error-banner", "detail-state", "detail", "detail-title", "detail-status", "summary",
                           "approval-panel", "approval-text", "approval-msg", "api-key-input", "approve-btn",
                           "diagnosis-state", "diagnosis", "rca-source", "rca-action", "rca-confidence",
@@ -142,3 +158,18 @@ def test_static_assets_are_served(client):
     assert js.status_code == 200 and "javascript" in js.headers["content-type"]
     assert css.status_code == 200 and "text/css" in css.headers["content-type"]
     assert client.get("/static/does-not-exist.js").status_code == 404
+
+
+def test_index_page_has_the_cluster_boxes_in_the_requested_order():
+    html = (DASHBOARD / "index.html").read_text(encoding="utf-8")
+    monitored = html.index('id="cluster-grid"')
+    incident_box = html.index('id="incident-box"')
+    analytics = html.index('id="analytics-heading"')
+    assert monitored < incident_box < analytics, "clusters row first, then the incident box, then analytics"
+    assert 'id="connect-btn"' in html
+
+
+def test_dashboard_writes_svg_without_markup_strings():
+    js = (DASHBOARD / "app.js").read_text(encoding="utf-8")
+    assert "createElementNS" in js
+    assert '"style"' not in js.replace('name !== "style"', ""), "never set a style attribute (CSP)"

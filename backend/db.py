@@ -63,6 +63,18 @@ UPDATABLE_FIELDS = frozenset(
 _TIMESTAMP_FIELDS = frozenset({"resolved_at", "injected_at"})
 _JSON_FIELDS = frozenset({"evidence_json", "rca_json"})
 
+#: Cluster connection states shown on the dashboard.
+CLUSTER_STATES = ("connecting", "connected", "forbidden", "unreachable", "not_configured", "error")
+
+#: The built-in cluster (in-cluster config or KUBE_CONTEXT). Incidents recorded
+#: before multi-cluster support belong to it, and it cannot be deleted.
+DEFAULT_CLUSTER_ID = 1
+
+#: Samples kept per cluster (about 30 minutes at the default 5 s interval).
+SAMPLE_RETENTION = 360
+
+MAX_CLUSTER_NAME_LENGTH = 63
+MAX_CONTEXT_LENGTH = 253
 MAX_SERVICE_LENGTH = 253
 MAX_NAMESPACE_LENGTH = 63
 MAX_REASON_LENGTH = 500
@@ -92,7 +104,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     rca_json             TEXT,
     action               TEXT
                          CHECK (action IS NULL OR action IN ({_in_list(VALID_ACTIONS)})),
-    remediation_attempts INTEGER NOT NULL DEFAULT 0
+    remediation_attempts INTEGER NOT NULL DEFAULT 0,
+    cluster_id           INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS timeline (
@@ -120,7 +133,50 @@ CREATE TABLE IF NOT EXISTS injections (
 
 CREATE INDEX IF NOT EXISTS idx_injections_lookup
     ON injections(service, namespace, consumed_by_incident, injected_at);
+
+CREATE TABLE IF NOT EXISTS clusters (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT    NOT NULL UNIQUE,
+    context        TEXT,
+    is_default     INTEGER NOT NULL DEFAULT 0,
+    state          TEXT    NOT NULL DEFAULT 'connecting'
+                   CHECK (state IN ({_in_list(CLUSTER_STATES)})),
+    state_detail   TEXT,
+    created_at     TEXT    NOT NULL,
+    last_sample_at TEXT,
+    snapshot_json  TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clusters_context ON clusters(context) WHERE context IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS cluster_samples (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id       INTEGER NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
+    ts               TEXT    NOT NULL,
+    pods_total       INTEGER NOT NULL DEFAULT 0,
+    pods_ready       INTEGER NOT NULL DEFAULT 0,
+    pods_unhealthy   INTEGER NOT NULL DEFAULT 0,
+    restarts_total   INTEGER NOT NULL DEFAULT 0,
+    warning_events   INTEGER NOT NULL DEFAULT 0,
+    log_lines        INTEGER NOT NULL DEFAULT 0,
+    error_lines      INTEGER NOT NULL DEFAULT 0,
+    interval_seconds REAL    NOT NULL DEFAULT 5
+);
+
+CREATE INDEX IF NOT EXISTS idx_samples_cluster_ts ON cluster_samples(cluster_id, id);
 """
+
+
+class ClusterError(Exception):
+    """A cluster operation cannot be honoured.
+
+    ``kind`` is ``not_found``, ``conflict`` (duplicate name/context, or the
+    cluster still has an open incident) or ``protected`` (the built-in cluster).
+    """
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class IncidentNotFoundError(LookupError):
@@ -302,6 +358,7 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
         "injected_at": row["injected_at"],
         "action": row["action"],
         "remediation_attempts": row["remediation_attempts"],
+        "cluster_id": row["cluster_id"],
         "mttd_seconds": _duration_seconds(row["injected_at"], row["detected_at"]),
         "mttr_seconds": (
             _duration_seconds(row["detected_at"], row["resolved_at"]) if status == "RESOLVED" else None
@@ -311,7 +368,7 @@ def _summary(row: sqlite3.Row) -> Dict[str, Any]:
 
 _SUMMARY_COLUMNS = (
     "id, service, namespace, reason, status, detected_at, resolved_at, "
-    "injected_at, action, remediation_attempts"
+    "injected_at, action, remediation_attempts, cluster_id"
 )
 
 
@@ -326,19 +383,27 @@ def init_db() -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with _session() as conn:
         conn.executescript(_SCHEMA)
+        # Databases created before multi-cluster support lack incidents.cluster_id.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(incidents)")}
+        if "cluster_id" not in columns:
+            conn.execute("ALTER TABLE incidents ADD COLUMN cluster_id INTEGER NOT NULL DEFAULT 1")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_incidents_cluster ON incidents(cluster_id, status)")
+    ensure_default_cluster()
     logger.info("Database initialised at %s", path)
 
 
-def create_incident(service: str, namespace: str, reason: str) -> int:
+def create_incident(service: str, namespace: str, reason: str, cluster_id: int = DEFAULT_CLUSTER_ID) -> int:
     """Insert a new incident with status DETECTED and return its ID."""
+    if isinstance(cluster_id, bool) or not isinstance(cluster_id, int) or cluster_id < 1:
+        raise ValueError(f"cluster_id must be a positive integer, got {cluster_id!r}")
     service = _require_text("service", service, MAX_SERVICE_LENGTH)
     namespace = _require_text("namespace", namespace, MAX_NAMESPACE_LENGTH)
     reason = _require_text("reason", reason, MAX_REASON_LENGTH, truncate=True)
     with _session() as conn:
         cursor = conn.execute(
-            "INSERT INTO incidents (service, namespace, reason, status, detected_at) "
-            "VALUES (?, ?, ?, 'DETECTED', ?)",
-            (service, namespace, reason, utc_now_iso()),
+            "INSERT INTO incidents (service, namespace, reason, status, detected_at, cluster_id) "
+            "VALUES (?, ?, ?, 'DETECTED', ?, ?)",
+            (service, namespace, reason, utc_now_iso(), cluster_id),
         )
         incident_id = int(cursor.lastrowid)
     logger.info("Created incident %s for %s/%s (%s)", incident_id, namespace, service, reason)
@@ -481,34 +546,41 @@ def get_metrics() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def find_open_incident(service: str, namespace: str) -> Optional[Dict[str, Any]]:
-    """Return the newest OPEN incident summary for a service/namespace, or ``None``."""
+def find_open_incident(service: str, namespace: str, cluster_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Return the newest OPEN incident summary for a service/namespace, or ``None``.
+
+    ``cluster_id=None`` looks across every cluster (the single-cluster behaviour).
+    """
     placeholders = ", ".join("?" for _ in OPEN_STATUSES)
+    cluster_sql = "" if cluster_id is None else " AND cluster_id = ?"
+    params: tuple = (service, namespace, *OPEN_STATUSES) + (() if cluster_id is None else (cluster_id,))
     with _session() as conn:
         row = conn.execute(  # nosec B608 - placeholders only, no user data in the SQL text
             f"SELECT {_SUMMARY_COLUMNS} FROM incidents "
-            f"WHERE service = ? AND namespace = ? AND status IN ({placeholders}) "
+            f"WHERE service = ? AND namespace = ? AND status IN ({placeholders}){cluster_sql} "
             "ORDER BY id DESC LIMIT 1",
-            (service, namespace, *OPEN_STATUSES),
+            params,
         ).fetchone()
     return _summary(row) if row else None
 
 
-def get_last_closed_at(service: str, namespace: str) -> Optional[str]:
+def get_last_closed_at(service: str, namespace: str, cluster_id: Optional[int] = None) -> Optional[str]:
     """Return when the latest RESOLVED or FAILED incident for a service ended.
 
     For RESOLVED incidents this is ``resolved_at``. FAILED incidents have no
     ``resolved_at`` (so MTTR is not distorted), so the time of their last
     timeline event is used. Used by the pipeline for cooldown decisions.
     """
+    cluster_sql = "" if cluster_id is None else " AND i.cluster_id = ?"
+    params: tuple = (service, namespace) + (() if cluster_id is None else (cluster_id,))
     with _session() as conn:
-        row = conn.execute(
+        row = conn.execute(  # nosec B608 - fixed SQL fragments, values are bound
             "SELECT MAX(COALESCE(i.resolved_at, "
             "    (SELECT MAX(t.timestamp) FROM timeline t WHERE t.incident_id = i.id), "
             "    i.detected_at)) AS closed_at "
             "FROM incidents i "
-            "WHERE i.service = ? AND i.namespace = ? AND i.status IN ('RESOLVED', 'FAILED')",
-            (service, namespace),
+            f"WHERE i.service = ? AND i.namespace = ? AND i.status IN ('RESOLVED', 'FAILED'){cluster_sql}",
+            params,
         ).fetchone()
     return row["closed_at"] if row else None
 
@@ -659,3 +731,197 @@ def claim_injection(incident_id: int, max_age_seconds: float) -> Optional[str]:
         if chosen is not None:
             conn.execute("UPDATE incidents SET injected_at = ? WHERE id = ?", (chosen, incident_id))
     return chosen
+
+
+# ---------------------------------------------------------------------------
+# Multi-cluster support: clusters, live samples, activity feed
+# ---------------------------------------------------------------------------
+
+
+def _cluster_row(row: sqlite3.Row) -> Dict[str, Any]:
+    snapshot = None
+    if row["snapshot_json"]:
+        try:
+            snapshot = json.loads(row["snapshot_json"])
+        except ValueError:
+            snapshot = None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "context": row["context"],
+        "is_default": bool(row["is_default"]),
+        "state": row["state"],
+        "state_detail": row["state_detail"],
+        "created_at": row["created_at"],
+        "last_sample_at": row["last_sample_at"],
+        "snapshot": snapshot,
+    }
+
+
+def ensure_default_cluster() -> int:
+    """Make sure the built-in cluster (id 1) exists; return its id. Safe to call repeatedly."""
+    name = os.environ.get("KUBE_CONTEXT", "").strip() or "primary"
+    with _session() as conn:
+        row = conn.execute("SELECT id FROM clusters WHERE id = ?", (DEFAULT_CLUSTER_ID,)).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO clusters (id, name, context, is_default, state, created_at) "
+                "VALUES (?, ?, NULL, 1, 'connecting', ?)",
+                (DEFAULT_CLUSTER_ID, name[:MAX_CLUSTER_NAME_LENGTH], utc_now_iso()),
+            )
+    return DEFAULT_CLUSTER_ID
+
+
+def create_cluster(name: str, context: str, state: str = "connected", state_detail: Optional[str] = None) -> int:
+    """Register an additional cluster by kubeconfig context name. Returns its id.
+
+    Only the context NAME is stored, never kubeconfig contents or credentials.
+
+    Raises:
+        ValueError: invalid name/context/state.
+        ClusterError: ``conflict`` when the name or context is already registered.
+    """
+    name = _require_text("name", name, MAX_CLUSTER_NAME_LENGTH)
+    context = _require_text("context", context, MAX_CONTEXT_LENGTH)
+    if state not in CLUSTER_STATES:
+        raise ValueError(f"Invalid cluster state {state!r}")
+    with _session() as conn:
+        if conn.execute("SELECT 1 FROM clusters WHERE context = ?", (context,)).fetchone():
+            raise ClusterError(f"Context {context!r} is already connected", "conflict")
+        if conn.execute("SELECT 1 FROM clusters WHERE name = ?", (name,)).fetchone():
+            raise ClusterError(f"A cluster named {name!r} already exists", "conflict")
+        cursor = conn.execute(
+            "INSERT INTO clusters (name, context, is_default, state, state_detail, created_at) "
+            "VALUES (?, ?, 0, ?, ?, ?)",
+            (name, context, state, state_detail, utc_now_iso()),
+        )
+        cluster_id = int(cursor.lastrowid)
+    logger.info("Connected cluster %s (%s) as id %s", name, context, cluster_id)
+    return cluster_id
+
+
+def list_clusters() -> List[Dict[str, Any]]:
+    """Return every cluster (built-in first) with its latest snapshot and incident counts."""
+    with _session() as conn:
+        rows = conn.execute("SELECT * FROM clusters ORDER BY is_default DESC, id ASC").fetchall()
+        open_marks = ", ".join("?" for _ in OPEN_STATUSES)
+        open_rows = conn.execute(  # nosec B608 - placeholders only
+            f"SELECT cluster_id, COUNT(*) AS n FROM incidents WHERE status IN ({open_marks}) GROUP BY cluster_id",
+            OPEN_STATUSES,
+        ).fetchall()
+        total_rows = conn.execute("SELECT cluster_id, COUNT(*) AS n FROM incidents GROUP BY cluster_id").fetchall()
+    open_by = {r["cluster_id"]: r["n"] for r in open_rows}
+    total_by = {r["cluster_id"]: r["n"] for r in total_rows}
+    result = []
+    for row in rows:
+        item = _cluster_row(row)
+        item["open_incidents"] = open_by.get(row["id"], 0)
+        item["total_incidents"] = total_by.get(row["id"], 0)
+        result.append(item)
+    return result
+
+
+def get_cluster(cluster_id: int) -> Optional[Dict[str, Any]]:
+    """Return one cluster, or ``None`` if it does not exist."""
+    _validate_id(cluster_id)
+    with _session() as conn:
+        row = conn.execute("SELECT * FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+    return _cluster_row(row) if row else None
+
+
+def delete_cluster(cluster_id: int) -> Dict[str, Any]:
+    """Disconnect a cluster and drop its samples. Incident history is kept.
+
+    Raises:
+        ClusterError: ``not_found``; ``protected`` for the built-in cluster;
+            ``conflict`` while any of its incidents is still open (solve it first).
+    """
+    _validate_id(cluster_id)
+    with _session() as conn:
+        row = conn.execute("SELECT * FROM clusters WHERE id = ?", (cluster_id,)).fetchone()
+        if row is None:
+            raise ClusterError(f"Cluster {cluster_id} not found", "not_found")
+        if row["is_default"]:
+            raise ClusterError("The built-in cluster cannot be deleted", "protected")
+        marks = ", ".join("?" for _ in OPEN_STATUSES)
+        open_count = conn.execute(  # nosec B608 - placeholders only
+            f"SELECT COUNT(*) AS n FROM incidents WHERE cluster_id = ? AND status IN ({marks})",
+            (cluster_id, *OPEN_STATUSES),
+        ).fetchone()["n"]
+        if open_count:
+            raise ClusterError(
+                f"Cluster {row['name']!r} still has {open_count} open incident(s); resolve them before deleting it",
+                "conflict",
+            )
+        conn.execute("DELETE FROM cluster_samples WHERE cluster_id = ?", (cluster_id,))
+        conn.execute("DELETE FROM clusters WHERE id = ?", (cluster_id,))
+    logger.info("Deleted cluster %s (%s)", cluster_id, row["name"])
+    return _cluster_row(row)
+
+
+def set_cluster_state(cluster_id: int, state: str, detail: Optional[str] = None) -> None:
+    """Record the connection state of a cluster (no error if it was deleted meanwhile)."""
+    if state not in CLUSTER_STATES:
+        raise ValueError(f"Invalid cluster state {state!r}")
+    with _session() as conn:
+        conn.execute(
+            "UPDATE clusters SET state = ?, state_detail = ? WHERE id = ?",
+            (state, (detail or "")[:300] or None, cluster_id),
+        )
+
+
+def record_sample(cluster_id: int, sample: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> None:
+    """Store one metrics sample (and the latest workload snapshot) for a cluster.
+
+    A sample for a cluster that was deleted while it was being taken is dropped.
+    Old samples beyond :data:`SAMPLE_RETENTION` are pruned.
+    """
+    ts = utc_now_iso()
+    with _session() as conn:
+        if conn.execute("SELECT 1 FROM clusters WHERE id = ?", (cluster_id,)).fetchone() is None:
+            return
+        conn.execute(
+            "INSERT INTO cluster_samples (cluster_id, ts, pods_total, pods_ready, pods_unhealthy, restarts_total, "
+            "warning_events, log_lines, error_lines, interval_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                cluster_id, ts,
+                int(sample.get("pods_total", 0)), int(sample.get("pods_ready", 0)), int(sample.get("pods_unhealthy", 0)),
+                int(sample.get("restarts_total", 0)), int(sample.get("warning_events", 0)),
+                int(sample.get("log_lines", 0)), int(sample.get("error_lines", 0)),
+                float(sample.get("interval_seconds", 5)),
+            ),
+        )
+        conn.execute(
+            "UPDATE clusters SET last_sample_at = ?, snapshot_json = ? WHERE id = ?",
+            (ts, json.dumps(snapshot, default=str) if snapshot is not None else None, cluster_id),
+        )
+        conn.execute(
+            "DELETE FROM cluster_samples WHERE cluster_id = ? AND id NOT IN "
+            "(SELECT id FROM cluster_samples WHERE cluster_id = ? ORDER BY id DESC LIMIT ?)",
+            (cluster_id, cluster_id, SAMPLE_RETENTION),
+        )
+
+
+def get_samples(cluster_id: int, limit: int = 60) -> List[Dict[str, Any]]:
+    """Return the newest ``limit`` samples of a cluster, oldest first."""
+    limit = max(1, min(int(limit), SAMPLE_RETENTION))
+    with _session() as conn:
+        rows = conn.execute(
+            "SELECT ts, pods_total, pods_ready, pods_unhealthy, restarts_total, warning_events, "
+            "log_lines, error_lines, interval_seconds FROM cluster_samples "
+            "WHERE cluster_id = ? ORDER BY id DESC LIMIT ?",
+            (cluster_id, limit),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def list_activity(limit: int = 40) -> List[Dict[str, Any]]:
+    """Return the newest timeline entries across all incidents (for the live activity feed)."""
+    limit = max(1, min(int(limit), 200))
+    with _session() as conn:
+        rows = conn.execute(
+            "SELECT t.id, t.incident_id, t.step, t.message, t.timestamp, i.service, i.namespace, i.cluster_id "
+            "FROM timeline t JOIN incidents i ON i.id = t.incident_id ORDER BY t.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]

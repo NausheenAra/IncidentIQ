@@ -35,9 +35,9 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from backend import collector, config, db, detector, rca, remediation
+from backend import collector, config, db, detector, kube, rca, remediation
 
 logger = logging.getLogger(__name__)
 
@@ -149,18 +149,19 @@ def _attempts(incident_id: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def skip_reason(service: str, namespace: str) -> Optional[str]:
+def skip_reason(service: str, namespace: str, cluster_id: Optional[int] = None) -> Optional[str]:
     """Return why a new incident must NOT be created now, or ``None`` if it may.
 
     Reasons: an incident is still open for the service, or the cooldown after
-    the last closed (RESOLVED or FAILED) incident has not elapsed.
+    the last closed (RESOLVED or FAILED) incident has not elapsed. ``cluster_id``
+    scopes both checks to one cluster (the same service name may exist in several).
     """
-    open_incident = db.find_open_incident(service, namespace)
+    open_incident = db.find_open_incident(service, namespace, cluster_id)
     if open_incident is not None:
         return f"incident {open_incident['id']} is still open ({open_incident['status']})"
     cooldown = config.get_settings().incident_cooldown_seconds
     if cooldown > 0:
-        elapsed = _seconds_since(db.get_last_closed_at(service, namespace))
+        elapsed = _seconds_since(db.get_last_closed_at(service, namespace, cluster_id))
         if elapsed is not None and elapsed < cooldown:
             return f"cooldown active ({cooldown - max(elapsed, 0):.0f}s remaining)"
     return None
@@ -179,15 +180,35 @@ def _validate_issue(issue: Any) -> Optional[Tuple[str, str, str]]:
     return values[0], values[1], values[2]
 
 
-def _create_incident_if_allowed(service: str, namespace: str, reason: str) -> Optional[int]:
+def _cluster_id_of(issue: Any) -> int:
+    """The cluster an issue was detected in (the built-in cluster when unspecified)."""
+    value = issue.get("cluster_id") if isinstance(issue, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    return db.DEFAULT_CLUSTER_ID
+
+
+def _context_of(cluster_id: int) -> Optional[str]:
+    """kubeconfig context for a cluster id (``None`` = the built-in cluster)."""
+    try:
+        cluster = db.get_cluster(cluster_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not look up cluster %s", cluster_id)
+        return None
+    return cluster["context"] if cluster else None
+
+
+def _create_incident_if_allowed(
+    service: str, namespace: str, reason: str, cluster_id: int = db.DEFAULT_CLUSTER_ID
+) -> Optional[int]:
     """Atomically check the open-incident and cooldown rules, then create the incident."""
     with _creation_lock:
         try:
-            skip = skip_reason(service, namespace)
+            skip = skip_reason(service, namespace, cluster_id)
             if skip is not None:
                 logger.info("Not creating an incident for %s/%s: %s", namespace, service, skip)
                 return None
-            return db.create_incident(service, namespace, reason)
+            return db.create_incident(service, namespace, reason, cluster_id)
         except Exception:  # noqa: BLE001 - fail closed: no incident rather than a duplicate
             logger.exception("Could not create an incident for %s/%s", namespace, service)
             return None
@@ -367,11 +388,19 @@ def handle_incident(issue: Dict[str, Any]) -> None:
         logger.warning("Ignoring issue for namespace %r: not in the allow-list", namespace)
         return
 
-    incident_id = _create_incident_if_allowed(service, namespace, reason)
+    cluster_id = _cluster_id_of(issue)
+    if db.get_cluster(cluster_id) is None:
+        logger.warning("Ignoring issue for cluster %s: it is not connected (any more)", cluster_id)
+        return
+
+    incident_id = _create_incident_if_allowed(service, namespace, reason, cluster_id)
     if incident_id is None:
         return
     try:
-        _run_lifecycle(incident_id, service, namespace, reason)
+        # Every Kubernetes call of this lifecycle (evidence, remediation, verification)
+        # goes to the cluster the issue was detected in, never to another one.
+        with kube.use_cluster(_context_of(cluster_id)):
+            _run_lifecycle(incident_id, service, namespace, reason)
     except Exception as exc:  # noqa: BLE001 - keep the incident record, mark it failed
         logger.exception("Incident %s failed unexpectedly", incident_id)
         _fail(incident_id, f"Unexpected pipeline error ({type(exc).__name__}); see the backend logs.")
@@ -415,12 +444,15 @@ def approve_incident(incident_id: int, *, background: bool = True) -> Dict[str, 
     if not db.transition_status(incident_id, "AWAITING_APPROVAL", "REMEDIATING"):
         raise ApprovalError(f"Incident {incident_id} was already approved or changed state", "conflict")
 
+    context = _context_of(incident.get("cluster_id") or db.DEFAULT_CLUSTER_ID)
+
     def work() -> None:
         try:
-            _remediate_and_verify(
-                incident_id, namespace, service, action,
-                approved=True, announce="Approved through the authenticated API.",
-            )
+            with kube.use_cluster(context):
+                _remediate_and_verify(
+                    incident_id, namespace, service, action,
+                    approved=True, announce="Approved through the authenticated API.",
+                )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Approved remediation for incident %s failed unexpectedly", incident_id)
             _fail(incident_id, f"Unexpected pipeline error ({type(exc).__name__}); see the backend logs.")
@@ -470,7 +502,7 @@ class DetectorLoop:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
-        self._active: Set[Tuple[str, str]] = set()
+        self._active: Set[Tuple[int, str, str]] = set()
         self._interval = float(config.get_settings().detector_interval_seconds)
         self._last_poll_at: Optional[str] = None
         self._last_issue_count = 0
@@ -511,7 +543,10 @@ class DetectorLoop:
                 "interval_seconds": self._interval,
                 "last_poll_at": self._last_poll_at,
                 "last_poll_issue_count": self._last_issue_count,
-                "in_flight": sorted(f"{ns}/{svc}" for ns, svc in self._active),
+                "in_flight": sorted(
+                    f"{ns}/{svc}" if cid == db.DEFAULT_CLUSTER_ID else f"cluster-{cid}:{ns}/{svc}"
+                    for cid, ns, svc in self._active
+                ),
             }
 
     # -- polling ------------------------------------------------------------
@@ -528,11 +563,7 @@ class DetectorLoop:
 
     def run_once(self) -> int:
         """Poll once and start workers for new incidents. Returns how many were started."""
-        try:
-            issues = detector.check_cluster()
-        except Exception:  # noqa: BLE001 - check_cluster should never raise; do not trust that
-            logger.exception("check_cluster() raised")
-            issues = []
+        issues = self._poll_all_clusters()
         with self._lock:
             self._last_poll_at = db.utc_now_iso()
             self._last_issue_count = len(issues)
@@ -544,13 +575,35 @@ class DetectorLoop:
                 started += 1
         return started
 
+    def _poll_all_clusters(self) -> List[Dict[str, Any]]:
+        """Run the detector against every connected cluster; tag each issue with its cluster id."""
+        try:
+            clusters = db.list_clusters()
+        except Exception:  # noqa: BLE001 - fall back to the built-in cluster
+            logger.exception("Could not list clusters; polling the built-in cluster only")
+            clusters = [{"id": db.DEFAULT_CLUSTER_ID, "context": None}]
+        issues: List[Dict[str, Any]] = []
+        for cluster in clusters:
+            if self._stop.is_set():
+                break
+            try:
+                with kube.use_cluster(cluster["context"]):
+                    found = detector.check_cluster()
+            except Exception:  # noqa: BLE001 - check_cluster should never raise; do not trust that
+                logger.exception("check_cluster() raised for cluster %s", cluster["id"])
+                continue
+            for issue in found or []:
+                issues.append({**issue, "cluster_id": cluster["id"]} if isinstance(issue, dict) else issue)
+        return issues
+
     def _try_start(self, issue: Any) -> bool:
         parsed = _validate_issue(issue)
         if parsed is None:
             logger.warning("Detector returned a malformed issue: %r", issue)
             return False
         service, namespace, _reason = parsed
-        key = (namespace, service)
+        cluster_id = _cluster_id_of(issue)
+        key = (cluster_id, namespace, service)
         with self._lock:
             if key in self._active:
                 return False  # a worker is already handling this service
@@ -558,7 +611,7 @@ class DetectorLoop:
                 logger.warning("Worker limit (%d) reached; %s/%s will be retried", self._max_workers, namespace, service)
                 return False
             try:
-                skip = skip_reason(service, namespace)
+                skip = skip_reason(service, namespace, cluster_id)
             except Exception:  # noqa: BLE001
                 logger.exception("Could not check open incidents for %s/%s", namespace, service)
                 return False

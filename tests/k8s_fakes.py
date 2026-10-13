@@ -251,6 +251,7 @@ class FakeAppsV1:
         self.deployment_error: Optional[Exception] = None
         self.list_rs_error: Optional[Exception] = None
         self.rs_reads = 0
+        self.deployments: List[Any] = []
         self.patches: List[Dict[str, Any]] = []
         self.patch_error: Optional[Exception] = None
 
@@ -266,6 +267,9 @@ class FakeAppsV1:
         if self.list_rs_error is not None:
             raise self.list_rs_error
         return SimpleNamespace(items=list(self.replica_sets.values()))
+
+    def list_namespaced_deployment(self, namespace: str, **kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(items=list(self.deployments))
 
     def read_namespaced_deployment(self, name: str, namespace: str, **kwargs: Any) -> Any:
         if self.deployment_error is not None:

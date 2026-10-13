@@ -36,6 +36,7 @@ Settings.from_env(env=None)       # build + validate; raises ConfigError
 | `GEMINI_TIMEOUT_SECONDS`* | `gemini_timeout_seconds` | `30` | 1-300 |
 | `KUBERNETES_NAMESPACE_ALLOWLIST` | `namespace_allowlist` | `default` | explicit RFC 1123 names; wildcards rejected |
 | `DETECTOR_INTERVAL_SECONDS` | `detector_interval_seconds` | `10` | 1-3600 |
+| `METRICS_INTERVAL_SECONDS`* | `metrics_interval_seconds` | `5` | 2-300 |
 | `UNHEALTHY_POD_GRACE_SECONDS` | `unhealthy_pod_grace_seconds` | `30` | 0-86400 |
 | `AUTO_REMEDIATE` | `auto_remediate` | `false` | boolean |
 | `ROLLBACK_MODE` | `rollback_mode` | `python` | `python` \| `kubectl` |
@@ -521,3 +522,35 @@ and that MTTD and MTTR are real numbers, then restore v1. Prints a table and exi
 deployed) so it can be approved in the dashboard. A detector reason different from the expected one is a note, not a failure.
 Tests: `tests/test_e2e_runner.py` (scripted fake backend; proves the runner fails on bad runs, not that a cluster behaves).
 
+## 14. Multi-cluster live dashboard [implemented]
+
+**Model.** `clusters` table (`id`, `name`, `context`, `is_default`, `state`, `state_detail`, `created_at`,
+`last_sample_at`, `snapshot_json`) and `cluster_samples` (one row per cluster per `METRICS_INTERVAL_SECONDS`, newest 360 kept).
+`incidents.cluster_id` (default `1`, added to existing databases automatically) says which cluster an incident belongs to.
+Cluster `1` is the **built-in** cluster (in-cluster config, or `KUBE_CONTEXT`); it has `context = NULL` and cannot be deleted.
+Only a kubeconfig **context name** is stored, never credentials.
+
+**Routing.** `kube.use_cluster(context)` is a context manager (backed by a `ContextVar`) that makes `kube.core_v1()` /
+`kube.apps_v1()` return clients for that kubeconfig context in the current thread. The detector loop wraps every
+`check_cluster()` in it and tags each issue with `cluster_id`; `pipeline.handle_incident` and `approve_incident` run the whole
+lifecycle (evidence, remediation, verification) inside it, so an incident can only ever act on the cluster it was detected in.
+Open-incident and cooldown checks are per cluster. All existing guardrails (allow-listed namespaces, two attempts, approval)
+apply unchanged to every cluster.
+
+**`backend/metrics.py`.** `MetricsSampler` samples every cluster in its own thread (read-only: list pods, deployments and
+events, read pod logs) and stores counts only: pods total/ready/unhealthy, restarts, warning events in the last minute,
+log lines and error-looking lines since the previous sample. Log text is never stored. CPU/memory are not sampled
+(they need metrics-server). A failing cluster is marked `unreachable`, `forbidden` or `not_configured` and retried.
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /api/clusters` | none | every cluster with `latest`, `series` (last 60 samples; log and error rates are per minute), `workloads`, `open_incidents`, `can_delete`, `delete_blocked_reason` |
+| `GET /api/activity?limit=` | none | newest incident timeline entries across all clusters (1-200) |
+| `GET /api/kube/contexts` | API key | context names in the backend's kubeconfig, with `active` and `connected` flags |
+| `POST /api/clusters` | API key | body `{name, context}`; the context must exist and answer a pod list, otherwise `400`; duplicates `409`; success `201` |
+| `DELETE /api/clusters/{id}` | API key | `404` unknown, `403` built-in cluster, `409` while the cluster has an open incident; incident history is kept |
+
+**Dashboard.** Order on `index.html`: monitored-clusters row (clusters without an open incident), the "active incident" box
+(clusters with one), KPI cards, live analytics (six charts, cluster selector, rising/falling arrows), incident analytics (status
+donut, MTTD/MTTR bars, detector reasons), workloads, activity feed, incident table with a cluster column. Charts are inline SVG built
+with `createElementNS`; the CSP and the "no `innerHTML`, no style attributes" rules still hold.

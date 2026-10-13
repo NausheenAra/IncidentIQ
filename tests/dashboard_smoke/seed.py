@@ -23,4 +23,18 @@ db.add_timeline(i1,"DETECTED","Detected CrashLoopBackOff"); db.add_timeline(i1,"
 i2 = db.create_incident("shop-api","default","NotReady")
 db.update_incident(i2, injected_at="2026-10-10T04:00:00+00:00", status="RESOLVED", action="rollback")
 db.add_timeline(i2,"RESOLVED","Recovery verified")
+
+# --- multi-cluster data: the built-in cluster has the open incident above; "staging" is healthy
+staging = db.create_cluster("staging", "kind-staging")
+for cid, bad in ((db.DEFAULT_CLUSTER_ID, True), (staging, False)):
+    for n in range(14):
+        db.record_sample(cid, {"pods_total": 2, "pods_ready": 1 if bad and n > 6 else 2, "pods_unhealthy": 1 if bad and n > 6 else 0,
+                               "restarts_total": (n // 3) if bad else 0, "warning_events": (n % 4) if bad else 0,
+                               "log_lines": 20 + n * 3, "error_lines": (n * 2) if bad else 0, "interval_seconds": 5},
+                         {"workloads": [{"name": "<img src=x onerror=window.__pwned=1>" if cid == staging else "shop-api", "namespace": "default",
+                                         "desired": 2, "ready": 1 if bad else 2, "image": "shop-api:v1", "restarts": 3 if bad else 0,
+                                         "problem": "CrashLoopBackOff" if bad else None, "status": "Degraded" if bad else "Healthy"}],
+                          "namespaces": ["default"]})
+db.set_cluster_state(db.DEFAULT_CLUSTER_ID, "connected")
+db.set_cluster_state(staging, "connected")
 print(i1, i2)

@@ -12,6 +12,11 @@ Endpoints (see docs/contracts.md):
     GET  /api/incidents/{id}             incident with evidence, RCA and timeline (404 if missing)
     GET  /api/metrics                    total, resolved, avg_mttd_seconds, avg_mttr_seconds
     GET  /api/status                     detector, Kubernetes and safety-mode snapshot (for the dashboard)
+    GET  /api/clusters                   connected clusters with live metrics series and workloads
+    GET  /api/activity                   newest incident timeline entries across all clusters
+    GET  /api/kube/contexts              [API key] kubeconfig context names available to connect
+    POST /api/clusters                   [API key] connect a cluster (kubeconfig context name) and start analysing it
+    DELETE /api/clusters/{id}            [API key] disconnect a cluster (refused while it has an open incident)
     POST /api/incidents/{id}/approve     [API key] approve the recommended action
     POST /api/injection                  [API key] record the failure-injection time
     GET  /healthz                        liveness probe
@@ -33,7 +38,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -41,7 +46,7 @@ from fastapi.staticfiles import StaticFiles
 from kubernetes.client.exceptions import ApiException
 from pydantic import BaseModel, Field
 
-from backend import config, db, kube, pipeline
+from backend import config, db, kube, metrics, pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,10 @@ _K8S_NAME_PATTERN = r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
 _NAMESPACE_PATTERN = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
 
 IncidentId = PathParam(..., ge=1, le=MAX_INCIDENT_ID, description="Incident id")
+ClusterId = PathParam(..., ge=1, le=MAX_INCIDENT_ID, description="Cluster id")
+
+#: Samples sent per cluster to the dashboard on each poll (about 5 minutes at the default interval).
+DASHBOARD_SERIES_POINTS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +84,17 @@ class InjectionRequest(BaseModel):
 
     service: str = Field(min_length=1, max_length=253, pattern=_K8S_NAME_PATTERN)
     namespace: str = Field(min_length=1, max_length=63, pattern=_NAMESPACE_PATTERN)
+
+
+class ClusterRequest(BaseModel):
+    """Body of ``POST /api/clusters``: a display name and a kubeconfig CONTEXT NAME.
+
+    Credentials are never sent to or stored by IncidentIQ; the context must
+    already exist in the kubeconfig available to the backend process.
+    """
+
+    name: str = Field(min_length=1, max_length=db.MAX_CLUSTER_NAME_LENGTH, pattern=r"^[A-Za-z0-9][A-Za-z0-9._ -]*$")
+    context: str = Field(min_length=1, max_length=db.MAX_CONTEXT_LENGTH, pattern=r"^[^\x00-\x1f\x7f]+$")
 
 
 def require_api_key(
@@ -154,6 +174,7 @@ def create_app(
     dash_dir = Path(dashboard_dir) if dashboard_dir is not None else DEFAULT_DASHBOARD_DIR
     loop = pipeline.DetectorLoop()
     probe = KubernetesProbe()
+    sampler = metrics.MetricsSampler()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -168,11 +189,13 @@ def create_app(
             logger.warning("Running with a temporary API key: approvals and injections need the key from .env")
         if start_detector:
             loop.start()
+            sampler.start()
         else:
-            logger.warning("Detector loop is disabled for this process")
+            logger.warning("Detector loop and metrics sampler are disabled for this process")
         try:
             yield
         finally:
+            sampler.stop()
             loop.stop()
             if not pipeline.join_workers():
                 logger.warning("Some incident workers were still running at shutdown")
@@ -186,6 +209,7 @@ def create_app(
         openapi_url=None if settings.is_production else "/openapi.json",
     )
     application.state.detector = loop
+    application.state.sampler = sampler
     application.state.kubernetes_probe = probe
 
     # -- error handling -----------------------------------------------------
@@ -244,8 +268,20 @@ def create_app(
             "namespaces": list(current.namespace_allowlist),
             "gemini_enabled": current.gemini_enabled,
             "detector": loop.status(),
+            "metrics": sampler.status(),
             "kubernetes": probe.get(),
         }
+
+    def cluster_payload(cluster: Dict[str, Any]) -> Dict[str, Any]:
+        return metrics.cluster_view(cluster, db.get_samples(cluster["id"], DASHBOARD_SERIES_POINTS))
+
+    @application.get("/api/clusters")
+    def list_clusters() -> Any:
+        return [cluster_payload(c) for c in db.list_clusters()]
+
+    @application.get("/api/activity")
+    def get_activity(limit: int = Query(40, ge=1, le=200)) -> Any:
+        return db.list_activity(limit)
 
     # -- protected operations ----------------------------------------------
 
@@ -265,6 +301,47 @@ def create_app(
             raise HTTPException(status_code=403, detail=f"Namespace {body.namespace!r} is not in the allow-list")
         injected_at = db.record_injection(body.service, body.namespace)
         return {"service": body.service, "namespace": body.namespace, "injected_at": injected_at}
+
+    @application.get("/api/kube/contexts", dependencies=[Depends(require_api_key)])
+    def list_kube_contexts() -> Any:
+        known = {c["context"] for c in db.list_clusters() if c["context"]}
+        return [{**c, "connected": c["name"] in known} for c in kube.list_contexts()]
+
+    @application.post("/api/clusters", status_code=201, dependencies=[Depends(require_api_key)])
+    def connect_cluster(body: ClusterRequest) -> Dict[str, Any]:
+        available = {c["name"] for c in kube.list_contexts()}
+        if not available:
+            raise HTTPException(
+                status_code=400,
+                detail="No kubeconfig contexts are available to the backend (is it running inside a cluster?)",
+            )
+        if body.context not in available:
+            raise HTTPException(status_code=400, detail=f"Context {body.context!r} was not found in the backend's kubeconfig")
+        state, detail = metrics.probe_context(body.context)
+        if state != "connected":
+            raise HTTPException(status_code=400, detail=f"Cannot connect to {body.context!r}: {state.replace('_', ' ')} ({detail})")
+        try:
+            cluster_id = db.create_cluster(body.name, body.context, "connected", detail)
+        except db.ClusterError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info("Cluster %r connected through the API (context %r)", body.name, body.context)
+        sampler.wake()
+        cluster = db.get_cluster(cluster_id)
+        assert cluster is not None
+        full = next((c for c in db.list_clusters() if c["id"] == cluster_id), cluster)
+        return cluster_payload(full)
+
+    @application.delete("/api/clusters/{cluster_id}", dependencies=[Depends(require_api_key)])
+    def disconnect_cluster(cluster_id: int = ClusterId) -> Dict[str, Any]:
+        try:
+            removed = db.delete_cluster(cluster_id)
+        except db.ClusterError as exc:
+            status = {"not_found": 404, "protected": 403, "conflict": 409}.get(exc.kind, 422)
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        if removed["context"]:
+            kube.forget_context(removed["context"])
+        logger.info("Cluster %s (%s) disconnected through the API", cluster_id, removed["name"])
+        return {"id": cluster_id, "name": removed["name"], "deleted": True}
 
     # -- dashboard ----------------------------------------------------------
 

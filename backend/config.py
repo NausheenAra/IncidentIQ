@@ -189,6 +189,8 @@ class Settings:
     incident_cooldown_seconds: int
     injection_max_age_seconds: int
 
+    metrics_interval_seconds: int = 5
+
     # -- derived helpers ----------------------------------------------------
 
     @property
@@ -305,6 +307,7 @@ class Settings:
             verification_interval_seconds=verification_interval,
             incident_cooldown_seconds=_get_int(env, "INCIDENT_COOLDOWN_SECONDS", 60, 0, 86400),
             injection_max_age_seconds=_get_int(env, "INJECTION_MAX_AGE_SECONDS", 600, 1, 86400),
+            metrics_interval_seconds=_get_int(env, "METRICS_INTERVAL_SECONDS", 5, 2, 300),
         )
 
 
